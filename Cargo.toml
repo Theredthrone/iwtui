@@ -1,0 +1,26 @@
+[package]
+name = "iwtui"
+version = "4.0.0"
+edition = "2021"
+description = "A drop-in nmtui-style TUI for iwd (Intel Wireless Daemon)"
+
+[dependencies]
+ratatui = "0.26"
+crossterm = { version = "0.27", features = ["event-stream"] }
+
+# Disable zbus's default `async-io` feature. This removes ~20 transitive crates.
+zbus = { version = "4.4", default-features = false, features = ["tokio"] }
+
+# Was `features = ["full"]`. We only use: rt, macros, sync, time.
+tokio = { version = "1.0", default-features = false, features = ["rt", "macros", "sync", "time"] }
+
+# Replaced `anyhow` and `nix` with `libc` and `futures-util` to reduce dependencies.
+libc = "0.2"
+futures-util = "0.3"
+
+[profile.release]
+# Lower optimization and disable LTO for 10x faster compile times
+opt-level = 1
+lto = false
+panic = "abort"
+strip = "symbols"
