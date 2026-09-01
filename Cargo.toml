@@ -1,6 +1,6 @@
 [package]
 name = "iwtui"
-version = "6.0.0"
+version = "0.5.0"
 edition = "2021"
 description = "A drop-in nmtui-style TUI for iwd (Intel Wireless Daemon)"
 license = "GPL-3.0-or-later"
