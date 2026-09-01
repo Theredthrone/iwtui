@@ -1,5 +1,28 @@
 [package]
 name = "iwtui"
+version = "0.5.0"          # kept the first version (adjust if needed)
+edition = "2021"
+description = "A terminal UI for managing Wi-Fi connections via iwd"
+repository = "https://github.com/Theredthrone/iwtui"
+license = "MIT"            # or your chosen license
+authors = ["Your Name <email@example.com>"]  # replace with actual
+
+[dependencies]
+ratatui = "0.28"
+zbus = "4.0"
+tokio = { version = "1", features = ["full"] }   # if async runtime is needed
+crossterm = "0.27"        # common for ratatui
+# add any other dependencies from your original second [package] section
+# (I'm assuming they were the same; if not, merge them here)
+
+# Optimizations for release builds
+[profile.release]
+opt-level = 3             # maximum optimization
+lto = true                # enable Link-Time Optimization
+codegen-units = 1         # better optimization (slower compile, but faster runtime)
+strip = true              # remove debug symbols from binary
+panic = "abort"           # smaller binary (optional)[package]
+name = "iwtui"
 version = "0.5.0"
 edition = "2021"
 description = "A drop-in nmtui-style TUI for iwd (Intel Wireless Daemon)"
