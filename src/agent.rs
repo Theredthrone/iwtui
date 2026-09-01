@@ -1,7 +1,26 @@
+//! D-Bus agent interface (`net.connman.iwd.Agent`).
+//!
+//! iwd calls into this object whenever it needs credentials (passphrase,
+//! WPA-Enterprise user/password, private-key passphrase). The agent forwards
+//! the request to the UI thread over an mpsc channel and blocks the D-Bus
+//! method call until the user answers — iwd keeps the connection attempt
+//! pending in the meantime.
+//!
+//! Signatures follow `iwd/doc/agent.txt` exactly:
+//!   RequestPassphrase(o)           -> s
+//!   RequestUserNameAndPassword(o)  -> ss
+//!   RequestUserPassword(o, s)      -> s
+//!   RequestPrivateKeyPassphrase(o) -> s
+//!   Release()                      ->
+//!   Cancel(o, s)                   ->
+
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot, Notify};
+
+use tokio::sync::{mpsc, oneshot};
 use zbus::interface;
 use zbus::zvariant::OwnedObjectPath;
+
 use crate::iwd::NetworkProxy;
 
 #[derive(Debug, zbus::DBusError)]
@@ -19,30 +38,23 @@ impl From<mpsc::error::SendError<AgentRequest>> for IwdAgentError {
     }
 }
 
+/// A credential prompt from iwd, waiting for the UI.
 #[allow(clippy::enum_variant_names)]
 pub enum AgentRequest {
     RequestPassphrase {
-        #[allow(dead_code)]
-        network_path: OwnedObjectPath,
         network_name: String,
         reply_to: oneshot::Sender<AgentReply<String>>,
     },
     RequestUserNameAndPassword {
-        #[allow(dead_code)]
-        network_path: OwnedObjectPath,
         network_name: String,
         reply_to: oneshot::Sender<AgentReply<(String, String)>>,
     },
     RequestUserPassword {
-        #[allow(dead_code)]
-        network_path: OwnedObjectPath,
         network_name: String,
         user: String,
         reply_to: oneshot::Sender<AgentReply<String>>,
     },
     RequestPrivateKeyPassphrase {
-        #[allow(dead_code)]
-        network_path: OwnedObjectPath,
         network_name: String,
         reply_to: oneshot::Sender<AgentReply<String>>,
     },
@@ -58,7 +70,7 @@ impl<T> AgentReply<T> {
         match self {
             AgentReply::Ok(v) => Ok(v),
             AgentReply::Cancelled => Err(IwdAgentError::Canceled(
-                "User cancelled the authentication request".into(),
+                "user cancelled the authentication request".into(),
             )),
         }
     }
@@ -67,7 +79,9 @@ impl<T> AgentReply<T> {
 pub struct IwdAgent {
     pub tx: mpsc::Sender<AgentRequest>,
     pub conn: zbus::Connection,
-    pub cancel: Arc<Notify>,
+    /// Set when iwd cancels a pending request; the UI polls it and closes
+    /// whatever dialog is on screen.
+    pub cancel_flag: Arc<AtomicBool>,
 }
 
 #[interface(name = "net.connman.iwd.Agent")]
@@ -76,13 +90,10 @@ impl IwdAgent {
         &self,
         network_path: OwnedObjectPath,
     ) -> Result<String, IwdAgentError> {
-        let network = NetworkProxy::new(&self.conn, network_path.clone()).await?;
-        let network_name = network.name().await.unwrap_or_else(|_| "Unknown".to_string());
-
+        let network_name = resolve_name(&self.conn, &network_path).await?;
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
             .send(AgentRequest::RequestPassphrase {
-                network_path,
                 network_name,
                 reply_to: reply_tx,
             })
@@ -97,13 +108,10 @@ impl IwdAgent {
         &self,
         network_path: OwnedObjectPath,
     ) -> Result<(String, String), IwdAgentError> {
-        let network = NetworkProxy::new(&self.conn, network_path.clone()).await?;
-        let network_name = network.name().await.unwrap_or_else(|_| "Unknown".to_string());
-
+        let network_name = resolve_name(&self.conn, &network_path).await?;
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
             .send(AgentRequest::RequestUserNameAndPassword {
-                network_path,
                 network_name,
                 reply_to: reply_tx,
             })
@@ -119,13 +127,10 @@ impl IwdAgent {
         network_path: OwnedObjectPath,
         user: String,
     ) -> Result<String, IwdAgentError> {
-        let network = NetworkProxy::new(&self.conn, network_path.clone()).await?;
-        let network_name = network.name().await.unwrap_or_else(|_| "Unknown".to_string());
-
+        let network_name = resolve_name(&self.conn, &network_path).await?;
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
             .send(AgentRequest::RequestUserPassword {
-                network_path,
                 network_name,
                 user,
                 reply_to: reply_tx,
@@ -141,13 +146,10 @@ impl IwdAgent {
         &self,
         network_path: OwnedObjectPath,
     ) -> Result<String, IwdAgentError> {
-        let network = NetworkProxy::new(&self.conn, network_path.clone()).await?;
-        let network_name = network.name().await.unwrap_or_else(|_| "Unknown".to_string());
-
+        let network_name = resolve_name(&self.conn, &network_path).await?;
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
             .send(AgentRequest::RequestPrivateKeyPassphrase {
-                network_path,
                 network_name,
                 reply_to: reply_tx,
             })
@@ -158,10 +160,32 @@ impl IwdAgent {
             .into_agent_result()
     }
 
-    #[zbus(name = "Cancel")]
-    fn cancel(&self) -> zbus::fdo::Result<()> {
-        // Use notify_one so the cancellation permit is stored if the UI is busy
-        self.cancel.notify_one();
+    /// iwd releases the agent when it no longer needs it (e.g. shutdown).
+    /// Nothing to clean up — we unregister explicitly on exit.
+    #[zbus(name = "Release")]
+    fn release(&self) -> zbus::fdo::Result<()> {
         Ok(())
     }
+
+    /// iwd calls `Cancel(object network, string reason)` with TWO arguments;
+    /// a wrong signature makes zbus reject the call and the password dialog
+    /// would stay stuck forever.
+    #[zbus(name = "Cancel")]
+    fn cancel(&self, _network_path: OwnedObjectPath, _reason: String) -> zbus::fdo::Result<()> {
+        self.cancel_flag.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// iwd only sends the network's object path — resolve its SSID so the
+/// dialog can show a human-readable name.
+async fn resolve_name(
+    conn: &zbus::Connection,
+    path: &OwnedObjectPath,
+) -> Result<String, IwdAgentError> {
+    let network = NetworkProxy::new(conn, path.clone()).await?;
+    Ok(network
+        .name()
+        .await
+        .unwrap_or_else(|_| "Unknown".to_string()))
 }
