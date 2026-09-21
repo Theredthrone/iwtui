@@ -1,533 +1,339 @@
-//! Everything we know about iwd: typed D-Bus proxies, the data types the
-//! rest of the app consumes, and a high-level [`IwdManager`] wrapper.
+//! D-Bus interface to iwd.
 //!
-//! Design rules:
-//! * Station object paths are dynamic — resolve via ObjectManager, never
-//!   hardcode `/net/connman/iwd/0`.
-//! * Fetches are few and wide: `get_networks` uses exactly 2 D-Bus calls
-//!   (GetOrderedNetworks + one GetManagedObjects cross-reference).
-//! * Failures propagate as `AppResult` errors; the app surfaces them in the
-//!   status bar so they are never silent.
+//! Everything that talks to `net.connman.iwd` lives here:
+//!
+//! * reading state:    [`snapshot`]
+//! * commands:         [`scan`], [`connect`], [`disconnect`], [`forget`]
+//! * change signals:   [`watch`]  (drives the auto-refresh)
+//! * credentials:      [`register_agent`] and the `Agent` impl
+//!
+//! API notes for iwd 3.x: connections are made with Network.Connect()
+//! (Station.Connect was removed long ago); networks and their security
+//! type come from the ObjectManager, which is also how iwctl reads them.
 
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
 
 use futures_util::StreamExt;
-use tokio::sync::{mpsc, Mutex};
-use zbus::fdo::{ObjectManagerProxy, PropertiesProxy};
-use zbus::proxy;
-use zbus::zvariant::{OwnedObjectPath, OwnedValue};
-use zbus::Connection;
+use tokio::sync::{mpsc, oneshot};
+use zbus::message::Type as MessageType;
+use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
+use zbus::{interface, Connection, MatchRule, Message, Proxy};
 
-use crate::{err, AppResult};
+use crate::app::{AgentQuery, AppEvent};
 
 pub const IWD_SERVICE: &str = "net.connman.iwd";
-pub const IWD_ROOT: &str = "/";
-const IF_STATION: &str = "net.connman.iwd.Station";
-const IF_NETWORK: &str = "net.connman.iwd.Network";
-const IF_KNOWN_NETWORK: &str = "net.connman.iwd.KnownNetwork";
+/// Where our agent object lives on the bus.
+pub const AGENT_PATH: &str = "/com/iwtui/agent";
 
-// ── data types ───────────────────────────────────────────────────
+const STATION_IFACE: &str = "net.connman.iwd.Station";
+const NETWORK_IFACE: &str = "net.connman.iwd.Network";
+const KNOWN_NETWORK_IFACE: &str = "net.connman.iwd.KnownNetwork";
+const AGENT_MANAGER_IFACE: &str = "net.connman.iwd.AgentManager";
+const PROPERTIES_IFACE: &str = "org.freedesktop.DBus.Properties";
+const OBJECT_MANAGER_IFACE: &str = "org.freedesktop.DBus.ObjectManager";
 
-/// A network visible in the scan results of the active Station.
+// ------------------------------------------------------------------ state
+
 #[derive(Debug, Clone)]
-pub struct AppNetwork {
+pub struct NetworkEntry {
     pub path: OwnedObjectPath,
     pub name: String,
+    /// Human readable, e.g. "WPA-PSK", "Open", "802.1X".
+    pub security: String,
+    /// Signal strength in dBm (only exposed by GetOrderedNetworks).
+    pub signal: Option<i16>,
     pub connected: bool,
-    /// RSSI in dBm. iwd reports centi-dBm over D-Bus; we convert exactly
-    /// once, here, so every consumer can use plain dBm values.
-    pub signal_dbm: i16,
-    /// iwd security type: "open", "psk", "8021x", "wep", ...
-    pub security_type: String,
 }
 
-/// A saved (known) network.
 #[derive(Debug, Clone)]
-pub struct AppKnownNetwork {
-    pub path: OwnedObjectPath,
-    pub name: String,
-    pub security_type: String,
-    pub auto_connect: bool,
-    pub hidden: bool,
-    /// iwd returns a free-form human string (absent if never connected).
-    pub last_connected: Option<String>,
+pub struct Snapshot {
+    pub station: OwnedObjectPath,
+    pub state: String,
+    pub scanning: bool,
+    pub networks: Vec<NetworkEntry>,
 }
 
-/// Coalesced change notifications from iwd D-Bus signals.
-#[allow(clippy::enum_variant_names)]
-#[derive(Debug, Clone)]
-pub enum IwdEvent {
-    NetworksChanged,
-    KnownNetworksChanged,
-    ConnectedNetworkChanged,
-}
-
-// ── typed proxy declarations ─────────────────────────────────────
-// Method names are snake_case and mapped to PascalCase D-Bus members by
-// the `#[proxy]` macro. Property setters must be named `set_*`.
-
-#[proxy(
-    interface = "net.connman.iwd.Adapter",
-    default_service = "net.connman.iwd"
-)]
-pub trait Adapter {
-    #[zbus(property)]
-    fn name(&self) -> zbus::fdo::Result<String>;
-
-    #[zbus(property)]
-    fn powered(&self) -> zbus::fdo::Result<bool>;
-
-    #[zbus(property)]
-    fn set_powered(&self, powered: bool) -> zbus::Result<()>;
-}
-
-#[proxy(
-    interface = "net.connman.iwd.Station",
-    default_service = "net.connman.iwd"
-)]
-pub trait Station {
-    fn scan(&self) -> zbus::Result<()>;
-    fn disconnect(&self) -> zbus::Result<()>;
-
-    /// Returns `a(on)`: object path + signal strength in **centi-dBm**
-    /// (e.g. -5200 means -52 dBm). Never treat the `n` as an SSID string.
-    fn get_ordered_networks(&self) -> zbus::Result<Vec<(OwnedObjectPath, i16)>>;
-
-    fn connect_hidden_network(&self, name: &str) -> zbus::Result<()>;
-
-    #[zbus(property)]
-    fn connected_network(&self) -> zbus::fdo::Result<OwnedObjectPath>;
-
-    #[zbus(property)]
-    fn state(&self) -> zbus::fdo::Result<String>;
-}
-
-#[proxy(
-    interface = "net.connman.iwd.Network",
-    default_service = "net.connman.iwd"
-)]
-pub trait Network {
-    fn connect(&self) -> zbus::Result<()>;
-
-    #[zbus(property)]
-    fn name(&self) -> zbus::fdo::Result<String>;
-}
-
-#[proxy(
-    interface = "net.connman.iwd.KnownNetwork",
-    default_service = "net.connman.iwd"
-)]
-pub trait KnownNetwork {
-    fn forget(&self) -> zbus::Result<()>;
-
-    #[zbus(property)]
-    fn name(&self) -> zbus::fdo::Result<String>;
-
-    #[zbus(property)]
-    fn auto_connect(&self) -> zbus::fdo::Result<bool>;
-
-    #[zbus(property)]
-    fn set_auto_connect(&self, auto_connect: bool) -> zbus::Result<()>;
-}
-
-#[proxy(
-    interface = "net.connman.iwd.AgentManager",
-    default_service = "net.connman.iwd",
-    default_path = "/net/connman/iwd"
-)]
-pub trait AgentManager {
-    fn register_agent(&self, path: &OwnedObjectPath) -> zbus::Result<()>;
-    fn unregister_agent(&self, path: &OwnedObjectPath) -> zbus::Result<()>;
-}
-
-// ── property helpers ─────────────────────────────────────────────
-
-/// Extract a `String` property from a D-Bus `{sv}` dictionary.
-///
-/// `OwnedValue` needs `try_clone()` (fallible deep copy) before
-/// `TryInto<String>` — this is the pattern proven to compile on zbus 4.
+// OwnedValue is not Clone in zbus 4, so properties are read by matching
+// on the borrowed Value variants.
 fn prop_str(props: &HashMap<String, OwnedValue>, key: &str) -> Option<String> {
-    props.get(key)?.try_clone().ok()?.try_into().ok()
+    match &**props.get(key)? {
+        Value::Str(s) => Some(s.to_string()),
+        _ => None,
+    }
 }
 
-/// Extract a `bool` property from a D-Bus `{sv}` dictionary.
 fn prop_bool(props: &HashMap<String, OwnedValue>, key: &str) -> Option<bool> {
-    props.get(key)?.try_clone().ok()?.try_into().ok()
+    match &**props.get(key)? {
+        Value::Bool(b) => Some(*b),
+        _ => None,
+    }
 }
 
-// ── the manager ──────────────────────────────────────────────────
-
-#[derive(Clone)]
-pub struct IwdManager {
-    pub conn: Option<Connection>,
-    station_path: Arc<Mutex<Option<OwnedObjectPath>>>,
+fn prop_i16(props: &HashMap<String, OwnedValue>, key: &str) -> Option<i16> {
+    match &**props.get(key)? {
+        Value::I16(v) => Some(*v),
+        _ => None,
+    }
 }
 
-impl IwdManager {
-    pub fn new(conn: Option<Connection>) -> Self {
-        Self {
-            conn,
-            station_path: Arc::new(Mutex::new(None)),
-        }
+fn prop_path(props: &HashMap<String, OwnedValue>, key: &str) -> Option<String> {
+    match &**props.get(key)? {
+        Value::ObjectPath(p) => Some(p.as_str().to_owned()),
+        _ => None,
     }
+}
 
-    fn conn(&self) -> AppResult<&Connection> {
-        self.conn
-            .as_ref()
-            .ok_or_else(|| err("The connection to iwd was closed"))
+fn pretty_security(raw: &str) -> String {
+    match raw {
+        "open" => "Open",
+        "psk" => "WPA-PSK",
+        "sae" => "WPA3",
+        "owe" => "Enh. Open",
+        "8021x" => "802.1X",
+        "wep" => "WEP",
+        other => other,
     }
+    .to_owned()
+}
 
-    // --------------------------------------------------------------
-    // Station path resolution
-    // --------------------------------------------------------------
+type ManagedObjects =
+    HashMap<OwnedObjectPath, HashMap<String, HashMap<String, OwnedValue>>>;
 
-    /// Resolve and cache the Station path once at startup.
-    pub async fn init_station_path(&self) -> AppResult<()> {
-        {
-            let path = self.station_path.lock().await;
-            if path.is_some() {
-                return Ok(());
-            }
-        }
-        self.get_station_path().await.map(|_| ())
-    }
+async fn managed_objects(conn: &Connection) -> zbus::Result<ManagedObjects> {
+    let om =
+        Proxy::new(conn, IWD_SERVICE, "/net/connman/iwd", OBJECT_MANAGER_IFACE).await?;
+    Ok(om.call("GetManagedObjects", &()).await?)
+}
 
-    /// Resolve the Station path, querying ObjectManager when not cached.
-    /// This guarantees recovery if iwd (or the Station) appears late — e.g.
-    /// after the Wi-Fi radio is powered on.
-    pub async fn get_station_path(&self) -> AppResult<OwnedObjectPath> {
-        {
-            let path = self.station_path.lock().await;
-            if let Some(p) = path.as_ref() {
-                return Ok(p.clone());
-            }
-        }
-        let conn = self.conn()?;
-        let om = ObjectManagerProxy::new(conn, IWD_SERVICE, IWD_ROOT).await?;
-        let objects = om.get_managed_objects().await?;
-        for (p, interfaces) in objects {
-            if interfaces.contains_key(IF_STATION) {
-                let mut path = self.station_path.lock().await;
-                *path = Some(p.clone());
-                return Ok(p);
-            }
-        }
-        Err(err("No Wi-Fi device was found — is the radio switched on?"))
-    }
+/// Everything the Wi-Fi screen shows, in one round of D-Bus calls.
+/// Returns `None` when there is no station (radio off / no Wi-Fi device).
+pub async fn snapshot(conn: &Connection) -> zbus::Result<Option<Snapshot>> {
+    let objects = managed_objects(conn).await?;
+    let Some(station) = objects
+        .iter()
+        .find(|(_, ifaces)| ifaces.contains_key(STATION_IFACE))
+        .map(|(path, _)| path.clone())
+    else {
+        return Ok(None);
+    };
 
-    /// Drop the cached Station path (station removed / radio powered off /
-    /// adapter re-appeared). The next call re-resolves dynamically.
-    pub async fn invalidate_station_path(&self) {
-        let mut path = self.station_path.lock().await;
-        *path = None;
-    }
+    let station_props =
+        Proxy::new(conn, IWD_SERVICE, station.clone(), PROPERTIES_IFACE).await?;
+    let all: HashMap<String, OwnedValue> = station_props.call("GetAll", &STATION_IFACE).await?;
+    let state = prop_str(&all, "State").unwrap_or_else(|| "unknown".to_owned());
+    let scanning = prop_bool(&all, "Scanning").unwrap_or(false);
+    let connected = prop_path(&all, "ConnectedNetwork").filter(|p| p != "/");
 
-    /// The adapter lives at the *parent* path of the Station
-    /// (`/net/connman/iwd/<phy>` vs `/net/connman/iwd/<phy>/<dev>`).
-    pub async fn get_adapter_path(&self) -> AppResult<OwnedObjectPath> {
-        let station = self.get_station_path().await?;
-        let s = station.as_str();
-        let parent = match s.rsplit_once('/') {
-            Some((p, _)) if !p.is_empty() => p.to_string(),
-            _ => s.to_string(),
-        };
-        OwnedObjectPath::try_from(parent)
-            .map_err(|e| err(format!("Invalid adapter path derived from {s}: {e}")))
-    }
+    let station_api =
+        Proxy::new(conn, IWD_SERVICE, station.clone(), STATION_IFACE).await?;
+    let ordered: Vec<(OwnedObjectPath, HashMap<String, OwnedValue>)> =
+        station_api.call("GetOrderedNetworks", &()).await?;
 
-    // --------------------------------------------------------------
-    // Device / radio state
-    // --------------------------------------------------------------
-
-    pub async fn get_device_name(&self) -> Option<String> {
-        let conn = self.conn().ok()?.clone();
-        let adapter_path = self.get_adapter_path().await.ok()?;
-        let adapter = AdapterProxy::new(&conn, adapter_path).await.ok()?;
-        adapter.name().await.ok()
-    }
-
-    pub async fn is_wifi_powered(&self) -> AppResult<bool> {
-        let conn = self.conn()?.clone();
-        let adapter_path = self.get_adapter_path().await?;
-        let adapter = AdapterProxy::new(&conn, adapter_path).await?;
-        Ok(adapter.powered().await?)
-    }
-
-    pub async fn set_wifi_powered(&self, on: bool) -> AppResult<()> {
-        let conn = self.conn()?.clone();
-        let adapter_path = self.get_adapter_path().await?;
-        let adapter = AdapterProxy::new(&conn, adapter_path).await?;
-        adapter.set_powered(on).await?;
-        Ok(())
-    }
-
-    pub async fn get_station_state(&self) -> AppResult<String> {
-        let conn = self.conn()?.clone();
-        let station = StationProxy::new(&conn, self.get_station_path().await?).await?;
-        Ok(station.state().await?)
-    }
-
-    // --------------------------------------------------------------
-    // Networks
-    // --------------------------------------------------------------
-
-    /// Exactly 2 D-Bus calls: GetOrderedNetworks + GetManagedObjects.
-    /// Signal strength arrives in centi-dBm and is converted to dBm here.
-    pub async fn get_networks(&self) -> AppResult<Vec<AppNetwork>> {
-        let conn = self.conn()?.clone();
-        let station_path = self.get_station_path().await?;
-        let station = StationProxy::new(&conn, station_path).await?;
-        let ordered = station.get_ordered_networks().await?;
-
-        let om = ObjectManagerProxy::new(&conn, IWD_SERVICE, IWD_ROOT).await?;
-        let objects = om.get_managed_objects().await?;
-
-        let mut networks = Vec::with_capacity(ordered.len());
-        let empty: HashMap<String, OwnedValue> = HashMap::new();
-        for (path, centi_dbm) in ordered {
-            let props = objects
+    let networks = ordered
+        .into_iter()
+        .map(|(path, scan_props)| {
+            // Name/Signal come from the scan result; the security type
+            // (and a Name fallback) from the Network object's own
+            // properties, exactly like iwctl reads them.
+            let object_props = objects
                 .get(&path)
-                .and_then(|ifs| ifs.get(IF_NETWORK))
-                .unwrap_or(&empty);
-
-            let name = prop_str(props, "Name").unwrap_or_else(|| "Unknown".to_string());
-            let security_type = prop_str(props, "Type").unwrap_or_else(|| "?".to_string());
-            let connected = prop_bool(props, "Connected").unwrap_or(false);
-
-            networks.push(AppNetwork {
-                path,
+                .and_then(|ifaces| ifaces.get(NETWORK_IFACE));
+            let name = prop_str(&scan_props, "Name")
+                .or_else(|| object_props.and_then(|p| prop_str(p, "Name")))
+                .unwrap_or_else(|| "<unknown>".to_owned());
+            let security = object_props
+                .and_then(|p| prop_str(p, "Type").or_else(|| prop_str(p, "Security")))
+                .map(|raw| pretty_security(&raw))
+                .unwrap_or_default();
+            let connected_flag = connected.as_deref() == Some(path.as_str())
+                || object_props
+                    .and_then(|p| prop_bool(p, "Connected"))
+                    .unwrap_or(false);
+            NetworkEntry {
+                signal: prop_i16(&scan_props, "Signal"),
                 name,
-                connected,
-                signal_dbm: (f32::from(centi_dbm) / 100.0).round() as i16,
-                security_type,
-            });
+                security,
+                connected: connected_flag,
+                path,
+            }
+        })
+        .collect();
+
+    Ok(Some(Snapshot { station, state, scanning, networks }))
+}
+
+// --------------------------------------------------------------- commands
+
+pub async fn scan(conn: &Connection, station: &OwnedObjectPath) -> zbus::Result<()> {
+    let p = Proxy::new(conn, IWD_SERVICE, station.clone(), STATION_IFACE).await?;
+    p.call_method("Scan", &()).await?;
+    Ok(())
+}
+
+/// Connect to `network` via Network.Connect.
+///
+/// If iwd needs a passphrase it will call our agent while this is in
+/// flight, so callers must spawn this instead of awaiting it inline.
+pub async fn connect(conn: &Connection, network: &OwnedObjectPath) -> zbus::Result<()> {
+    let p = Proxy::new(conn, IWD_SERVICE, network.clone(), NETWORK_IFACE).await?;
+    p.call_method("Connect", &()).await?;
+    Ok(())
+}
+
+pub async fn disconnect(conn: &Connection, station: &OwnedObjectPath) -> zbus::Result<()> {
+    let p = Proxy::new(conn, IWD_SERVICE, station.clone(), STATION_IFACE).await?;
+    p.call_method("Disconnect", &()).await?;
+    Ok(())
+}
+
+/// Delete the saved profile ("known network") behind a scanned network.
+pub async fn forget(conn: &Connection, network: &OwnedObjectPath) -> zbus::Result<()> {
+    let props = Proxy::new(conn, IWD_SERVICE, network.clone(), PROPERTIES_IFACE).await?;
+    let known: Option<OwnedValue> =
+        props.call("Get", &(NETWORK_IFACE, "KnownNetwork")).await.ok();
+    let Some(known) = known else { return Ok(()) };
+    let known_path = match &*known {
+        Value::ObjectPath(p) => p.as_str().to_owned(),
+        _ => return Ok(()), // not a known network; nothing to forget
+    };
+    let known_network =
+        Proxy::new(conn, IWD_SERVICE, known_path, KNOWN_NETWORK_IFACE).await?;
+    known_network.call_method("Delete", &()).await?;
+    Ok(())
+}
+
+// ------------------------------------------------------------------ agent
+
+struct Agent {
+    events: mpsc::Sender<AppEvent>,
+}
+
+/// Implements net.connman.iwd.Agent: iwd calls these methods whenever it
+/// needs credentials from the user; we forward them to the UI as events
+/// and answer through the oneshot channel carried in the event.
+#[interface(name = "net.connman.iwd.Agent")]
+impl Agent {
+    async fn release(&self) {}
+
+    /// iwd no longer wants the answer it asked for.
+    async fn cancel(&self, reason: String) {
+        let _ = self.events.send(AppEvent::AgentCancelled(reason)).await;
+    }
+
+    async fn request_passphrase(&self, network: OwnedObjectPath) -> zbus::fdo::Result<String> {
+        let (respond, answer) = oneshot::channel::<Option<String>>();
+        self.events
+            .send(AppEvent::AgentQuery(AgentQuery::Passphrase { network, respond }))
+            .await
+            .map_err(|_| zbus::fdo::Error::Failed("UI is gone".to_owned()))?;
+        match answer.await {
+            Ok(Some(passphrase)) => Ok(passphrase),
+            _ => Err(zbus::fdo::Error::Failed("cancelled".to_owned())),
         }
-        Ok(networks)
     }
+}
 
-    /// Single GetManagedObjects call. `LastConnectedTime` is a *string*
-    /// property in iwd, not a number.
-    pub async fn get_known_networks(&self) -> AppResult<Vec<AppKnownNetwork>> {
-        let conn = self.conn()?.clone();
-        let manager = ObjectManagerProxy::new(&conn, IWD_SERVICE, IWD_ROOT).await?;
-        let objects = manager.get_managed_objects().await?;
-        let mut networks = Vec::new();
-        for (path, interfaces) in objects {
-            if let Some(props) = interfaces.get(IF_KNOWN_NETWORK) {
-                let name = prop_str(props, "Name").unwrap_or_default();
-                let security_type = prop_str(props, "Type").unwrap_or_else(|| "?".to_string());
-                let auto_connect = prop_bool(props, "AutoConnect").unwrap_or(true);
-                let hidden = prop_bool(props, "Hidden").unwrap_or(false);
-                let last_connected = prop_str(props, "LastConnectedTime")
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty());
-                networks.push(AppKnownNetwork {
-                    path,
-                    name,
-                    security_type,
-                    auto_connect,
-                    hidden,
-                    last_connected,
-                });
-            }
+pub async fn register_agent(
+    conn: &Connection,
+    events: mpsc::Sender<AppEvent>,
+) -> zbus::Result<()> {
+    conn.object_server().at(AGENT_PATH, Agent { events }).await?;
+    let manager =
+        Proxy::new(conn, IWD_SERVICE, "/net/connman/iwd", AGENT_MANAGER_IFACE).await?;
+    manager.call_method("RegisterAgent", &AGENT_PATH).await?;
+    Ok(())
+}
+
+pub async fn unregister_agent(conn: &Connection) -> zbus::Result<()> {
+    let manager =
+        Proxy::new(conn, IWD_SERVICE, "/net/connman/iwd", AGENT_MANAGER_IFACE).await?;
+    manager.call_method("UnregisterAgent", &AGENT_PATH).await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------- signals
+
+/// Translate every interesting iwd signal into `AppEvent::IwdChanged`.
+/// The main loop debounces these and re-reads state, which is what
+/// keeps the network list fresh without any manual refresh.
+pub async fn watch(conn: Connection, events: mpsc::Sender<AppEvent>) -> zbus::Result<()> {
+    let iwd_rule = MatchRule::builder()
+        .msg_type(MessageType::Signal)
+        .sender(IWD_SERVICE)?
+        .build();
+    let mut iwd_signals = zbus::MessageStream::for_match_rule(iwd_rule, &conn, None).await?;
+
+    // Also notice iwd itself (re)starting on the bus.
+    let ownership = MatchRule::builder()
+        .msg_type(MessageType::Signal)
+        .sender("org.freedesktop.DBus")?
+        .interface("org.freedesktop.DBus")?
+        .member("NameOwnerChanged")?
+        .build();
+    let mut ownership_signals =
+        zbus::MessageStream::for_match_rule(ownership, &conn, None).await?;
+
+    loop {
+        tokio::select! {
+            message = iwd_signals.next() => match message {
+                Some(Ok(msg)) => {
+                    if signal_relevant(&msg) {
+                        let _ = events.send(AppEvent::IwdChanged).await;
+                    }
+                }
+                Some(Err(_)) => {}
+                None => break,
+            },
+            message = ownership_signals.next() => match message {
+                Some(Ok(msg)) => {
+                    if let Ok((name, _, _)) =
+                        msg.body().deserialize::<(String, String, String)>()
+                    {
+                        if name == IWD_SERVICE {
+                            let _ = events.send(AppEvent::IwdChanged).await;
+                        }
+                    }
+                }
+                Some(Err(_)) => {}
+                None => break,
+            },
         }
-        networks.sort_by_key(|n| n.name.to_lowercase());
-        Ok(networks)
     }
+    Ok(())
+}
 
-    // --------------------------------------------------------------
-    // Actions
-    // --------------------------------------------------------------
+fn signal_relevant(msg: &Message) -> bool {
+    let interface = msg.header().interface().map(|i| i.as_str().to_owned());
+    let member = msg.header().member().map(|m| m.as_str().to_owned());
 
-    pub async fn connect_network(&self, path: OwnedObjectPath) -> AppResult<()> {
-        let conn = self.conn()?.clone();
-        let network = NetworkProxy::new(&conn, path).await?;
-        network.connect().await?;
-        Ok(())
+    match (interface.as_deref(), member.as_deref()) {
+        // networks appearing/disappearing after a scan
+        (Some(STATION_IFACE), Some("NetworkAdded" | "NetworkRemoved")) => true,
+        // device/station appearing or going away (radio toggle, hotplug)
+        (
+            Some("org.freedesktop.DBus.ObjectManager"),
+            Some("InterfacesAdded" | "InterfacesRemoved"),
+        ) => true,
+        (Some(PROPERTIES_IFACE), Some("PropertiesChanged")) => properties_relevant(msg),
+        _ => false,
     }
+}
 
-    pub async fn connect_hidden_network(&self, name: &str) -> AppResult<()> {
-        let conn = self.conn()?.clone();
-        let station = StationProxy::new(&conn, self.get_station_path().await?).await?;
-        station.connect_hidden_network(name).await?;
-        Ok(())
-    }
-
-    pub async fn disconnect(&self) -> AppResult<()> {
-        let conn = self.conn()?.clone();
-        let station = StationProxy::new(&conn, self.get_station_path().await?).await?;
-        station.disconnect().await?;
-        Ok(())
-    }
-
-    pub async fn trigger_scan(&self) -> AppResult<()> {
-        let conn = self.conn()?.clone();
-        let station = StationProxy::new(&conn, self.get_station_path().await?).await?;
-        station.scan().await?;
-        Ok(())
-    }
-
-    pub async fn forget_known_network(&self, path: &OwnedObjectPath) -> AppResult<()> {
-        let conn = self.conn()?.clone();
-        let proxy = KnownNetworkProxy::new(&conn, path.clone()).await?;
-        proxy.forget().await?;
-        Ok(())
-    }
-
-    pub async fn set_auto_connect(&self, path: &OwnedObjectPath, enabled: bool) -> AppResult<()> {
-        let conn = self.conn()?.clone();
-        let proxy = KnownNetworkProxy::new(&conn, path.clone()).await?;
-        proxy.set_auto_connect(enabled).await?;
-        Ok(())
-    }
-
-    // --------------------------------------------------------------
-    // Signal listeners
-    // --------------------------------------------------------------
-
-    /// Spawn background listeners for iwd signals. Events are *filtered* by
-    /// interface/property instead of firing on every PropertiesChanged blip,
-    /// and Station interfaces appearing/disappearing invalidate the cached
-    /// station path so the app recovers from radio power toggles and adapter
-    /// re-insertion.
-    pub fn spawn_signal_listener(&self) -> mpsc::Receiver<IwdEvent> {
-        let (tx, rx) = mpsc::channel(64);
-        let Some(conn) = self.conn.clone() else {
-            return rx; // no connection, no events
-        };
-        let manager = self.clone();
-
-        tokio::spawn(async move {
-            // -- 1) Station property changes (State / ConnectedNetwork / Networks)
-            {
-                let tx = tx.clone();
-                let conn = conn.clone();
-                let manager = manager.clone();
-                tokio::spawn(async move {
-                    loop {
-                        let Ok(path) = manager.get_station_path().await else {
-                            tokio::time::sleep(Duration::from_secs(2)).await;
-                            continue;
-                        };
-                        let Ok(props) = PropertiesProxy::new(&conn, IWD_SERVICE, path).await else {
-                            tokio::time::sleep(Duration::from_secs(2)).await;
-                            continue;
-                        };
-                        let Ok(mut stream) = props.receive_properties_changed().await else {
-                            tokio::time::sleep(Duration::from_secs(1)).await;
-                            continue;
-                        };
-                        while let Some(sig) = stream.next().await {
-                            let Ok(args) = sig.args() else { continue };
-                            if args.interface_name.as_str() != IF_STATION {
-                                continue;
-                            }
-                            for key in args.changed_properties.keys() {
-                                match *key {
-                                    "Networks" => {
-                                        let _ = tx.try_send(IwdEvent::NetworksChanged);
-                                    }
-                                    "State" | "ConnectedNetwork" => {
-                                        let _ = tx.try_send(IwdEvent::ConnectedNetworkChanged);
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                    }
-                });
-            }
-
-            // -- 2) ObjectManager: InterfacesAdded
-            {
-                let tx = tx.clone();
-                let conn = conn.clone();
-                let manager = manager.clone();
-                tokio::spawn(async move {
-                    loop {
-                        let Ok(om) = ObjectManagerProxy::new(&conn, IWD_SERVICE, IWD_ROOT).await
-                        else {
-                            tokio::time::sleep(Duration::from_secs(2)).await;
-                            continue;
-                        };
-                        let Ok(mut stream) = om.receive_interfaces_added().await else {
-                            tokio::time::sleep(Duration::from_secs(1)).await;
-                            continue;
-                        };
-                        while let Some(sig) = stream.next().await {
-                            let Ok(args) = sig.args() else { continue };
-                            let mut nets = false;
-                            let mut known = false;
-                            for name in args.interfaces_and_properties.keys() {
-                                match *name {
-                                    IF_STATION => {
-                                        // A (new) Station appeared — the cached
-                                        // path may be stale or was unresolvable.
-                                        manager.invalidate_station_path().await;
-                                    }
-                                    IF_NETWORK => nets = true,
-                                    IF_KNOWN_NETWORK => known = true,
-                                    _ => {}
-                                }
-                            }
-                            if nets {
-                                let _ = tx.try_send(IwdEvent::NetworksChanged);
-                            }
-                            if known {
-                                let _ = tx.try_send(IwdEvent::KnownNetworksChanged);
-                            }
-                        }
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                    }
-                });
-            }
-
-            // -- 3) ObjectManager: InterfacesRemoved
-            {
-                let tx = tx.clone();
-                let conn = conn.clone();
-                let manager = manager.clone();
-                tokio::spawn(async move {
-                    loop {
-                        let Ok(om) = ObjectManagerProxy::new(&conn, IWD_SERVICE, IWD_ROOT).await
-                        else {
-                            tokio::time::sleep(Duration::from_secs(2)).await;
-                            continue;
-                        };
-                        let Ok(mut stream) = om.receive_interfaces_removed().await else {
-                            tokio::time::sleep(Duration::from_secs(1)).await;
-                            continue;
-                        };
-                        while let Some(sig) = stream.next().await {
-                            let Ok(args) = sig.args() else { continue };
-                            let mut nets = false;
-                            let mut known = false;
-                            for name in args.interfaces.iter() {
-                                match *name {
-                                    IF_STATION => {
-                                        manager.invalidate_station_path().await;
-                                    }
-                                    IF_NETWORK => nets = true,
-                                    IF_KNOWN_NETWORK => known = true,
-                                    _ => {}
-                                }
-                            }
-                            if nets {
-                                let _ = tx.try_send(IwdEvent::NetworksChanged);
-                            }
-                            if known {
-                                let _ = tx.try_send(IwdEvent::KnownNetworksChanged);
-                            }
-                        }
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                    }
-                });
-            }
-        });
-
-        rx
+fn properties_relevant(msg: &Message) -> bool {
+    let Ok((owner, changed, invalidated)) = msg
+        .body()
+        .deserialize::<(String, HashMap<String, OwnedValue>, Vec<String>)>()
+    else {
+        return false;
+    };
+    match owner.as_str() {
+        // State: connected/disconnected/...; Scanning false => scan
+        // results are in; ConnectedNetwork: we associated or roamed.
+        STATION_IFACE => ["State", "Scanning", "ConnectedNetwork"].iter().any(|key| {
+            changed.contains_key(*key) || invalidated.iter().any(|i| i.as_str() == *key)
+        }),
+        NETWORK_IFACE => changed.contains_key("Connected"),
+        "net.connman.iwd.Device" | "net.connman.iwd.Adapter" => changed.contains_key("Powered"),
+        _ => false,
     }
 }

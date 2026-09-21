@@ -1,30 +1,7 @@
 [package]
 name = "iwtui"
-version = "0.5.0"          # kept the first version (adjust if needed)
-edition = "2021"
-description = "A terminal UI for managing Wi-Fi connections via iwd"
-repository = "https://github.com/Theredthrone/iwtui"
-license = "MIT"            # or your chosen license
-authors = ["Your Name <email@example.com>"]  # replace with actual
-
-[dependencies]
-ratatui = "0.28"
-zbus = "4.0"
-tokio = { version = "1", features = ["full"] }   # if async runtime is needed
-crossterm = "0.27"        # common for ratatui
-# add any other dependencies from your original second [package] section
-# (I'm assuming they were the same; if not, merge them here)
-
-# Optimizations for release builds
-[profile.release]
-opt-level = 3             # maximum optimization
-lto = true                # enable Link-Time Optimization
-codegen-units = 1         # better optimization (slower compile, but faster runtime)
-strip = true              # remove debug symbols from binary
-panic = "abort"           # smaller binary (optional)[package]
-name = "iwtui"
-version = "0.5.0"
-edition = "2021"
+version = "0.0.1"
+edition = "2024"
 description = "A drop-in nmtui-style TUI for iwd (Intel Wireless Daemon)"
 license = "GPL-3.0-or-later"
 readme = "README.md"
@@ -34,19 +11,11 @@ categories = ["command-line-utilities", "network-programming"]
 [dependencies]
 ratatui = "0.30"
 crossterm = { version = "0.29", features = ["event-stream"] }
-
-# Disable zbus's default `async-io` feature. This removes ~20 transitive crates.
 zbus = { version = "4.4", default-features = false, features = ["tokio"] }
-
-# We only use: rt, macros, sync, time (+ signal for clean SIGTERM/SIGHUP).
-tokio = { version = "1.0", default-features = false, features = ["rt", "macros", "sync", "time", "signal"] }
-
-# Replaced `anyhow` and `nix` with `libc` and `futures-util` to reduce dependencies.
-libc = "0.2"
+tokio = { version = "1.0", default-features = false, features = ["rt", "macros", "sync", "time"] }
 futures-util = "0.3"
 
 [profile.release]
-# Lower optimization and disable LTO for 10x faster compile times
 opt-level = 1
 lto = false
 panic = "abort"
@@ -58,29 +27,4 @@ debug = false
 incremental = true
 
 [profile.dev.package."*"]
-opt-level = 2[package]
-name = "iwtui"
-version = "4.0.0"
-edition = "2021"
-description = "A drop-in nmtui-style TUI for iwd (Intel Wireless Daemon)"
-
-[dependencies]
-ratatui = "0.26"
-crossterm = { version = "0.27", features = ["event-stream"] }
-
-# Disable zbus's default `async-io` feature. This removes ~20 transitive crates.
-zbus = { version = "4.4", default-features = false, features = ["tokio"] }
-
-# Was `features = ["full"]`. We only use: rt, macros, sync, time.
-tokio = { version = "1.0", default-features = false, features = ["rt", "macros", "sync", "time"] }
-
-# Replaced `anyhow` and `nix` with `libc` and `futures-util` to reduce dependencies.
-libc = "0.2"
-futures-util = "0.3"
-
-[profile.release]
-# Lower optimization and disable LTO for 10x faster compile times
-opt-level = 1
-lto = false
-panic = "abort"
-strip = "symbols"
+opt-level = 2
