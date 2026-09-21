@@ -34,9 +34,9 @@ quarter of a second.
 
 | Requirement | Notes |
 |---|---|
-| Linux, iwd ≥ 1.10 | developed against iwd 3.12 (Arch) |
-| Rust (edition 2021) | build-time only |
-| D-Bus access to `net.connman.iwd` | the same policy that lets `iwctl` run |
+- Linux with iwd running (developed against iwd 3.12)
+- Rust (stable) — build-time only
+- D-Bus access to `net.connman.iwd` — the same policy that lets `iwctl` run
 
 ## Build & run
 
@@ -129,10 +129,14 @@ The whole codebase can be regenerated with `bash make-iwtui.sh` (the
 original scaffolding script). Design notes, D-Bus gotchas, and a
 verification checklist live in `MEMORY.md`.
 
-## Roadmap
+
 
 - Radio power screen (nmtui `Radio` parity)
 - Known-networks browser (list, forget, autoconnect toggle)
 - Hidden-network connect
 - `SignalLevelAgent` for instant signal bars (replaces the 3 s poll)
 - 802.1X / private-key credentials in the agent
+
+## License
+
+GPL-3.0-or-later — see [LICENSE](LICENSE).
